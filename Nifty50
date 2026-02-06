@@ -1,0 +1,211 @@
+import os, math, json
+from datetime import datetime, timedelta, timezone
+import requests
+import pandas as pd
+import yfinance as yf
+
+# ================= TIMEZONE =================
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# ================= CONFIG ===================
+TOP_N = 5
+IT_SYMBOLS = {"INFY", "TCS", "WIPRO", "HCLTECH", "TECHM"}
+
+NSE_HOME = "https://www.nseindia.com"
+NSE_PREOPEN_ENDPOINTS = [
+    "https://www.nseindia.com/api/market-data-pre-open?key=NIFTY",
+    "https://www.nseindia.com/api/market-data-pre-open?key=NIFTY%2050",
+]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com"
+}
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
+
+STATE_FILE = "state.json"
+
+# ================= TELEGRAM =================
+def tg(msg):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print(msg)
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TG_CHAT_ID, "text": msg}, timeout=10)
+
+# ================= TIME CHECKS ==============
+def now_ist():
+    return datetime.now(IST)
+
+def is_weekday():
+    return now_ist().weekday() < 5
+
+def in_preopen_window():
+    t = now_ist().time()
+    return t >= datetime.strptime("09:09", "%H:%M").time() and t <= datetime.strptime("09:12", "%H:%M").time()
+
+def in_market_hours():
+    t = now_ist().time()
+    return t >= datetime.strptime("09:15", "%H:%M").time() and t <= datetime.strptime("15:30", "%H:%M").time()
+
+# ================= NSE PREOPEN ==============
+def fetch_preopen():
+    s = requests.Session()
+    s.get(NSE_HOME, headers=HEADERS, timeout=10)
+    for url in NSE_PREOPEN_ENDPOINTS:
+        try:
+            r = s.get(url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except:
+            continue
+    raise RuntimeError("NSE Preopen fetch failed")
+
+def build_top5():
+    js = fetch_preopen()
+    rows = []
+
+    for item in js.get("data", []):
+        md = item.get("metadata", {})
+        po = item.get("detail", {}).get("preOpenMarket", {})
+
+        sym = md.get("symbol")
+        chg = md.get("pChange")
+        buy = po.get("totalBuyQuantity", 0)
+        sell = po.get("totalSellQuantity", 0)
+        qty = po.get("totalTradedQuantity", 0)
+
+        if not sym or chg is None or buy == 0 or sell == 0 or qty == 0:
+            continue
+
+        imbalance = max(buy, sell) / min(buy, sell)
+        score = abs(chg) * math.log(qty) * math.log(1 + imbalance)
+
+        rows.append({"symbol": sym, "chg": abs(chg), "score": score})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise RuntimeError("No valid preopen data")
+
+    median_chg = df["chg"].median()
+    df = df[~((df["symbol"].isin(IT_SYMBOLS)) & (df["chg"] < median_chg))]
+
+    return df.sort_values("score", ascending=False).head(TOP_N)["symbol"].tolist()
+
+# ================= PDH / PDL =================
+def pdh_pdl(sym):
+    d = yf.Ticker(sym + ".NS").history(period="10d", interval="1d")
+    if len(d) < 2:
+        return None
+    y = d.iloc[-2]
+    return float(y["High"]), float(y["Low"])
+
+# ================= ATR 15M ==================
+def atr_15m(sym, n=14):
+    df = yf.Ticker(sym + ".NS").history(period="5d", interval="15m")
+    if len(df) < n + 2:
+        return None
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev = close.shift(1)
+    tr = pd.concat([(high-low).abs(), (high-prev).abs(), (low-prev).abs()], axis=1).max(axis=1)
+    return tr.tail(n).mean()
+
+# ================= SUSTAIN ===================
+def sustain(sym, side, pdh, pdl):
+    df = yf.Ticker(sym + ".NS").history(period="5d", interval="15m")
+    if len(df) < 3:
+        return False
+    c1, c2 = df["Close"].iloc[-1], df["Close"].iloc[-2]
+    if side == "BUY":
+        return c1 > pdh and c2 > pdh
+    return c1 < pdl and c2 < pdl
+
+# ================= LEVELS ====================
+def levels(side, pdh, pdl, atr):
+    base = pdh if side == "BUY" else pdl
+    buffer = max(0.0005 * base, 0.25 * atr)
+
+    if side == "BUY":
+        entry = base + buffer
+        sl = entry - 1.2 * atr
+        target = entry + 2 * (entry - sl)
+    else:
+        entry = base - buffer
+        sl = entry + 1.2 * atr
+        target = entry - 2 * (sl - entry)
+
+    rr = abs(target-entry)/abs(entry-sl)
+    return round(entry,2), round(sl,2), round(target,2), round(rr,2)
+
+# ================= STATE =====================
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(s):
+    with open(STATE_FILE, "w") as f:
+        json.dump(s, f)
+
+# ================= MAIN ======================
+def main():
+    if not is_weekday():
+        return
+
+    state = load_state()
+    today = now_ist().strftime("%Y-%m-%d")
+
+    # ----- PREOPEN -----
+    if in_preopen_window():
+        picks = build_top5()
+        tg("📌 NSE PRE-OPEN TOP 5\n" + "\n".join(picks) + "\n\nWAIT FOR 15-MIN SUSTAIN")
+        save_state({"date": today, "picks": picks, "triggered": {}})
+        return
+
+    # ----- INTRADAY -----
+    if not in_market_hours():
+        return
+
+    if state.get("date") != today:
+        return
+
+    for sym in state.get("picks", []):
+        if state["triggered"].get(sym):
+            continue
+
+        pdh_pdl_val = pdh_pdl(sym)
+        if not pdh_pdl_val:
+            continue
+        pdh, pdl = pdh_pdl_val
+
+        daily = yf.Ticker(sym + ".NS").history(period="3d", interval="1d")
+        side = "BUY" if daily["Close"].iloc[-1] >= daily["Close"].iloc[-2] else "SELL"
+
+        if not sustain(sym, side, pdh, pdl):
+            continue
+
+        atr = atr_15m(sym)
+        if not atr:
+            continue
+
+        entry, sl, target, rr = levels(side, pdh, pdl, atr)
+        if rr < 1.8:
+            continue
+
+        tg(
+            f"🟢 {side} TRIGGERED — {sym}\n"
+            f"Entry: {entry}\nSL: {sl}\nTarget: {target}\nRR: {rr}\n\n"
+            f"Execute on Groww"
+        )
+
+        state["triggered"][sym] = True
+        save_state(state)
+
+if __name__ == "__main__":
+    main()
